@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: bbb-backend
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /health
+
