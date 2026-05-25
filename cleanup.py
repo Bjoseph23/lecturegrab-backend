@@ -18,6 +18,8 @@ async def cleanup_expired_jobs(store: JobStore) -> None:
             continue
         if job.status in {"queued", "downloading", "processing"}:
             continue
+        if any(file_status.status in {"queued", "processing"} for file_status in job.file_statuses.values()):
+            continue
         await cleanup_job_directories(job)
         await store.remove_job(job.id)
 
@@ -31,4 +33,3 @@ async def cleanup_loop(store: JobStore, interval_seconds: int = CLEANUP_INTERVAL
         except Exception:
             pass
         await asyncio.sleep(interval_seconds)
-

@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 import shutil
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from jobs import Job, JobStore, READY_FILE_TYPES
+from jobs import AUTO_FILE_TYPES, DERIVED_FILE_TYPES, FileTaskStatus, Job, JobStore, READY_FILE_TYPES
 
+
+logger = logging.getLogger("bbb-backend.downloader")
 
 BBB_URL_RE = re.compile(
     r"^https://[^/]+/playback/presentation/2\.[^/]+/[^/?#]+/?$",
@@ -71,6 +75,48 @@ def parse_progress_line(line: str) -> tuple[str, int, str] | None:
     return None
 
 
+def artifact_path(job: Job, file_type: str) -> Path:
+    return job.output_dir / FILE_NAME_MAP[file_type]
+
+
+def _status_for_existing_file(job: Job, file_type: str) -> FileTaskStatus:
+    path = artifact_path(job, file_type)
+    if path.exists():
+        return FileTaskStatus(
+            status="ready",
+            progress=100,
+            stage="Ready",
+            requested_at=datetime.now(UTC),
+        )
+    if file_type in AUTO_FILE_TYPES:
+        return FileTaskStatus(status="pending", progress=0, stage="Waiting for base recording")
+    return FileTaskStatus(status="pending", progress=0, stage="Ready to process on request")
+
+
+async def initialize_file_statuses(job: Job, store: JobStore) -> None:
+    for file_type in FILE_TYPE_ORDER:
+        status = _status_for_existing_file(job, file_type)
+        await store.update_file_status(
+            job.id,
+            file_type,
+            status=status.status,
+            progress=status.progress,
+            stage=status.stage,
+            error=status.error,
+            requested_at=status.requested_at,
+        )
+
+
+async def refresh_available_files(job: Job, store: JobStore) -> list[str]:
+    available = [
+        file_type
+        for file_type in FILE_TYPE_ORDER
+        if artifact_path(job, file_type).exists()
+    ]
+    await store.update_job(job.id, available_files=available)
+    return available
+
+
 async def _stream_process_output(process: subprocess.Popen[str], job: Job, store: JobStore) -> list[str]:
     lines: list[str] = []
     assert process.stdout is not None
@@ -82,6 +128,7 @@ async def _stream_process_output(process: subprocess.Popen[str], job: Job, store
         if not text:
             continue
         lines.append(text)
+        logger.info("bbb-dl[%s] %s", job.id, text)
 
         updates: dict[str, str | int] = {}
         if progress := parse_progress_line(text):
@@ -145,43 +192,127 @@ async def cleanup_job_directories(job: Job) -> None:
             await asyncio.to_thread(shutil.rmtree, path, True)
 
 
-async def _collect_output_files(job: Job) -> list[str]:
+async def collect_base_files(job: Job, store: JobStore) -> list[str]:
     job.output_dir.mkdir(parents=True, exist_ok=True)
 
     mp4_candidates = sorted(job.temp_dir.rglob("*.mp4"))
     if mp4_candidates:
-        destination = job.output_dir / FILE_NAME_MAP["mp4"]
+        destination = artifact_path(job, "mp4")
+        await store.update_file_status(job.id, "mp4", status="processing", progress=75, stage="Moving lecture video")
         await asyncio.to_thread(shutil.move, str(mp4_candidates[0]), str(destination))
+        await store.update_file_status(job.id, "mp4", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
 
     located = {
         "webcam_webm": next(iter(sorted(job.temp_dir.rglob("webcams.webm"))), None),
         "deskshare_webm": next(iter(sorted(job.temp_dir.rglob("deskshare.webm"))), None),
-        "transcript_json": next(iter(sorted(job.temp_dir.rglob("presentation_text.json"))), None),
-        "notes_html": next(iter(sorted(job.temp_dir.rglob("notes.html"))), None),
     }
 
     for file_type, source in located.items():
-        if source is not None:
-            await _copy_if_exists(source, job.output_dir / FILE_NAME_MAP[file_type])
+        if source is None:
+            continue
+        await store.update_file_status(job.id, file_type, status="processing", progress=80, stage="Publishing base file")
+        copied = await _copy_if_exists(source, artifact_path(job, file_type))
+        if copied:
+            await store.update_file_status(job.id, file_type, status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+        else:
+            await store.update_file_status(job.id, file_type, status="failed", progress=0, stage="Missing source file", error="Source file missing")
 
-    webcams_path = job.output_dir / FILE_NAME_MAP["webcam_webm"]
-    audio_path = job.output_dir / FILE_NAME_MAP["audio_mp3"]
-    with contextlib.suppress(Exception):
-        await _extract_audio(webcams_path, audio_path)
+    await initialize_file_statuses(job, store)
+    return await refresh_available_files(job, store)
 
-    await _zip_slide_svgs(job.temp_dir, job.output_dir / FILE_NAME_MAP["slides_zip"])
 
-    return [
-        file_type
-        for file_type in FILE_TYPE_ORDER
-        if (job.output_dir / FILE_NAME_MAP[file_type]).exists()
-    ]
+async def _process_audio(job: Job, store: JobStore) -> bool:
+    webcams_path = artifact_path(job, "webcam_webm")
+    audio_path = artifact_path(job, "audio_mp3")
+    await store.update_file_status(job.id, "audio_mp3", status="processing", progress=15, stage="Checking webcam audio", error=None)
+    if not webcams_path.exists():
+        await store.update_file_status(job.id, "audio_mp3", status="failed", progress=0, stage="Webcam file missing", error="webcams.webm is required")
+        return False
+    await store.update_file_status(job.id, "audio_mp3", progress=55, stage="Extracting MP3 audio")
+    created = await _extract_audio(webcams_path, audio_path)
+    if created:
+        await store.update_file_status(job.id, "audio_mp3", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+        await refresh_available_files(job, store)
+        return True
+    await store.update_file_status(job.id, "audio_mp3", status="failed", progress=0, stage="Audio extraction failed", error="ffmpeg could not create audio.mp3")
+    return False
+
+
+async def _process_slides(job: Job, store: JobStore) -> bool:
+    slides_zip_path = artifact_path(job, "slides_zip")
+    await store.update_file_status(job.id, "slides_zip", status="processing", progress=20, stage="Scanning slide assets", error=None)
+    await store.update_file_status(job.id, "slides_zip", progress=70, stage="Packaging slides")
+    created = await _zip_slide_svgs(job.temp_dir, slides_zip_path)
+    if created:
+        await store.update_file_status(job.id, "slides_zip", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+        await refresh_available_files(job, store)
+        return True
+    await store.update_file_status(job.id, "slides_zip", status="failed", progress=0, stage="No slides found", error="No SVG slide files were generated")
+    return False
+
+
+async def _process_simple_copy(job: Job, store: JobStore, file_type: str, source_name: str, stage: str) -> bool:
+    destination = artifact_path(job, file_type)
+    await store.update_file_status(job.id, file_type, status="processing", progress=35, stage=stage, error=None)
+    source = next(iter(sorted(job.temp_dir.rglob(source_name))), None)
+    if source is None:
+        await store.update_file_status(job.id, file_type, status="failed", progress=0, stage="Source missing", error=f"{source_name} was not generated")
+        return False
+    copied = await _copy_if_exists(source, destination)
+    if copied:
+        await store.update_file_status(job.id, file_type, status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+        await refresh_available_files(job, store)
+        return True
+    await store.update_file_status(job.id, file_type, status="failed", progress=0, stage="Copy failed", error=f"Could not copy {source_name}")
+    return False
+
+
+async def process_file(job: Job, store: JobStore, file_type: str) -> bool:
+    if file_type not in READY_FILE_TYPES:
+        raise ValueError(f"Unsupported file type: {file_type}")
+
+    if file_type in AUTO_FILE_TYPES:
+        path = artifact_path(job, file_type)
+        if path.exists():
+            await store.update_file_status(job.id, file_type, status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+            await refresh_available_files(job, store)
+            return True
+        await store.update_file_status(job.id, file_type, status="failed", progress=0, stage="Base file missing", error="Base recording file is not available")
+        return False
+
+    if file_type == "audio_mp3":
+        return await _process_audio(job, store)
+    if file_type == "slides_zip":
+        return await _process_slides(job, store)
+    if file_type == "transcript_json":
+        return await _process_simple_copy(job, store, file_type, "presentation_text.json", "Collecting transcript")
+    if file_type == "notes_html":
+        return await _process_simple_copy(job, store, file_type, "notes.html", "Collecting notes")
+    raise ValueError(f"Unhandled file type: {file_type}")
+
+
+async def run_file_task(job_id: str, file_type: str, store: JobStore) -> None:
+    job = await store.require_job(job_id)
+    try:
+        await process_file(job, store, file_type)
+    except asyncio.CancelledError:
+        await store.update_file_status(job_id, file_type, status="pending", progress=0, stage="Cancelled")
+        raise
+    except Exception as exc:
+        logger.exception("File processing failed for job %s file %s", job_id, file_type)
+        await store.update_file_status(job_id, file_type, status="failed", progress=0, stage="Processing failed", error=str(exc))
+    finally:
+        await store.pop_file_task(job_id, file_type)
 
 
 async def run_job(job: Job, store: JobStore) -> None:
     process: subprocess.Popen[str] | None = None
     try:
         await store.update_job(job.id, status="downloading", progress=0, stage="Starting download")
+        for file_type in FILE_TYPE_ORDER:
+            initial_stage = "Waiting for base recording" if file_type in AUTO_FILE_TYPES else "Ready to process on request"
+            await store.update_file_status(job.id, file_type, status="pending", progress=0, stage=initial_stage, error=None)
+
         job.temp_dir.mkdir(parents=True, exist_ok=True)
         job.output_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
@@ -192,6 +323,7 @@ async def run_job(job: Job, store: JobStore) -> None:
             "--max-parallel-chromes",
             "2",
         ]
+        logger.info("Starting bbb-dl job %s for %s", job.id, job.url)
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -203,24 +335,27 @@ async def run_job(job: Job, store: JobStore) -> None:
         return_code = await asyncio.to_thread(process.wait)
         if return_code != 0:
             error = lines[-1] if lines else "bbb-dl failed"
+            logger.error("bbb-dl job %s failed: %s", job.id, error)
             await store.update_job(job.id, status="failed", stage="Failed", error=error)
             return
 
-        available_files = await _collect_output_files(job)
+        available_files = await collect_base_files(job, store)
         title = job.title
-        if title is None and (job.output_dir / FILE_NAME_MAP["mp4"]).exists():
-            title = (job.output_dir / FILE_NAME_MAP["mp4"]).stem.replace("_", " ")
+        if title is None and artifact_path(job, "mp4").exists():
+            title = artifact_path(job, "mp4").stem.replace("_", " ")
 
         await store.update_job(
             job.id,
             status="ready",
             progress=100,
-            stage="Done",
+            stage="Base recording ready",
             title=title,
             available_files=available_files,
             error=None,
         )
+        logger.info("bbb-dl job %s completed", job.id)
     except asyncio.CancelledError:
+        logger.info("bbb-dl job %s cancelled", job.id)
         if process is not None and process.poll() is None:
             with contextlib.suppress(Exception):
                 process.terminate()
@@ -229,4 +364,5 @@ async def run_job(job: Job, store: JobStore) -> None:
         await cleanup_job_directories(job)
         raise
     except Exception as exc:
+        logger.exception("Unexpected error while running job %s", job.id)
         await store.update_job(job.id, status="failed", stage="Failed", error=str(exc))
