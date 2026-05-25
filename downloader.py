@@ -23,6 +23,8 @@ PARTITION_RE = re.compile(r"(?P<done>\d+)/7 Partition finished")
 TITLE_RE = re.compile(r"Title:\s*(?P<value>.+)")
 DATE_RE = re.compile(r"Date:\s*(?P<value>.+)")
 DURATION_RE = re.compile(r"Duration:\s*(?P<value>.+)")
+FINAL_VIDEO_RE = re.compile(r"All done!\s+Final video:\s*(?P<value>.+\.mp4)", re.IGNORECASE)
+TIME_PROGRESS_RE = re.compile(r"Time:\s*(?P<value>\d+:\d{2}(?::\d{2})?)")
 FILE_NAME_MAP = {
     "mp4": "recording.mp4",
     "webcam_webm": "webcams.webm",
@@ -147,6 +149,40 @@ async def _stream_process_output(process: subprocess.Popen[str], job: Job, store
     return lines
 
 
+def _normalise_duration(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return value.split(".")[0].strip()
+
+
+def _extract_final_video_path(lines: list[str]) -> Path | None:
+    for line in reversed(lines):
+        match = FINAL_VIDEO_RE.search(line)
+        if match:
+            return Path(match.group("value").strip())
+    return None
+
+
+def _extract_last_duration(lines: list[str]) -> str | None:
+    for line in reversed(lines):
+        match = TIME_PROGRESS_RE.search(line)
+        if match:
+            return _normalise_duration(match.group("value"))
+    return None
+
+
+def _extract_metadata_from_final_video_path(video_path: Path) -> tuple[str | None, str | None]:
+    stem = video_path.stem
+    if "_" not in stem:
+        return None, None
+
+    prefix, raw_title = stem.split("_", 1)
+    date_value = prefix[:10] if len(prefix) >= 10 else None
+    cleaned_title = raw_title.replace("_", " ").strip()
+    cleaned_title = re.sub(r"\s*\(All participants\)\s*$", "", cleaned_title, flags=re.IGNORECASE).strip()
+    return cleaned_title or None, date_value
+
+
 async def _copy_if_exists(source: Path, destination: Path) -> bool:
     if not source.exists():
         return False
@@ -192,14 +228,18 @@ async def cleanup_job_directories(job: Job) -> None:
             await asyncio.to_thread(shutil.rmtree, path, True)
 
 
-async def collect_base_files(job: Job, store: JobStore) -> list[str]:
+async def collect_base_files(job: Job, store: JobStore, final_video_source: Path | None) -> list[str]:
     job.output_dir.mkdir(parents=True, exist_ok=True)
 
-    mp4_candidates = sorted(job.temp_dir.rglob("*.mp4"))
-    if mp4_candidates:
+    mp4_source = final_video_source if final_video_source and final_video_source.exists() else None
+    if mp4_source is None:
+        mp4_candidates = sorted(job.temp_dir.rglob("*.mp4"), key=lambda path: path.stat().st_size if path.exists() else 0, reverse=True)
+        mp4_source = mp4_candidates[0] if mp4_candidates else None
+
+    if mp4_source is not None:
         destination = artifact_path(job, "mp4")
         await store.update_file_status(job.id, "mp4", status="processing", progress=75, stage="Moving lecture video")
-        await asyncio.to_thread(shutil.move, str(mp4_candidates[0]), str(destination))
+        await asyncio.to_thread(shutil.move, str(mp4_source), str(destination))
         await store.update_file_status(job.id, "mp4", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
 
     located = {
@@ -305,6 +345,14 @@ async def run_file_task(job_id: str, file_type: str, store: JobStore) -> None:
         await store.pop_file_task(job_id, file_type)
 
 
+async def _auto_process_derived_files(job: Job, store: JobStore) -> None:
+    for file_type in ("audio_mp3", "slides_zip", "transcript_json", "notes_html"):
+        try:
+            await process_file(job, store, file_type)
+        except Exception:
+            logger.exception("Automatic processing failed for job %s file %s", job.id, file_type)
+
+
 async def run_job(job: Job, store: JobStore) -> None:
     process: subprocess.Popen[str] | None = None
     try:
@@ -339,8 +387,18 @@ async def run_job(job: Job, store: JobStore) -> None:
             await store.update_job(job.id, status="failed", stage="Failed", error=error)
             return
 
-        available_files = await collect_base_files(job, store)
+        final_video_source = _extract_final_video_path(lines)
+        available_files = await collect_base_files(job, store, final_video_source)
+        await _auto_process_derived_files(job, store)
+        available_files = await refresh_available_files(job, store)
+
         title = job.title
+        date_value = job.date
+        duration_value = _normalise_duration(job.duration) or _extract_last_duration(lines)
+        if final_video_source is not None:
+            inferred_title, inferred_date = _extract_metadata_from_final_video_path(final_video_source)
+            title = title or inferred_title
+            date_value = date_value or inferred_date
         if title is None and artifact_path(job, "mp4").exists():
             title = artifact_path(job, "mp4").stem.replace("_", " ")
 
@@ -348,8 +406,10 @@ async def run_job(job: Job, store: JobStore) -> None:
             job.id,
             status="ready",
             progress=100,
-            stage="Base recording ready",
+            stage="Done",
             title=title,
+            date=date_value,
+            duration=duration_value,
             available_files=available_files,
             error=None,
         )
