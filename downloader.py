@@ -183,6 +183,14 @@ def _extract_metadata_from_final_video_path(video_path: Path) -> tuple[str | Non
     return cleaned_title or None, date_value
 
 
+def _find_first_existing(job: Job, *patterns: str) -> Path | None:
+    for pattern in patterns:
+        matches = sorted(job.temp_dir.rglob(pattern))
+        if matches:
+            return matches[0]
+    return None
+
+
 async def _copy_if_exists(source: Path, destination: Path) -> bool:
     if not source.exists():
         return False
@@ -248,31 +256,63 @@ async def _transcode_final_video(source: Path, destination: Path) -> bool:
     return (await process.wait()) == 0 and destination.exists()
 
 
+async def _publish_mp4(job: Job, store: JobStore, source: Path, stage: str) -> bool:
+    destination = artifact_path(job, "mp4")
+    await store.update_file_status(job.id, "mp4", status="processing", progress=75, stage=stage, error=None)
+    transcode_ok = await _transcode_final_video(source, destination)
+    if not transcode_ok and source.suffix.lower() == ".mp4":
+        await asyncio.to_thread(shutil.copy2, source, destination)
+    if destination.exists():
+        await store.update_file_status(job.id, "mp4", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+        return True
+    await store.update_file_status(
+        job.id,
+        "mp4",
+        status="failed",
+        progress=0,
+        stage="Video export failed",
+        error="Unable to generate a browser-compatible MP4",
+    )
+    return False
+
+
+async def _mark_unavailable_auto_files(job: Job, store: JobStore, message: str) -> None:
+    for file_type in AUTO_FILE_TYPES:
+        if artifact_path(job, file_type).exists():
+            continue
+        await store.update_file_status(
+            job.id,
+            file_type,
+            status="failed",
+            progress=0,
+            stage="Unavailable",
+            error=message,
+        )
+
+
 async def cleanup_job_directories(job: Job) -> None:
     for path in (job.temp_dir, job.output_dir):
         if path.exists():
             await asyncio.to_thread(shutil.rmtree, path, True)
 
 
-async def collect_base_files(job: Job, store: JobStore, final_video_source: Path | None) -> list[str]:
+async def collect_base_files(job: Job, store: JobStore, final_video_source: Path | None, *, allow_fallback_mp4: bool = False) -> list[str]:
     job.output_dir.mkdir(parents=True, exist_ok=True)
 
-    mp4_source = final_video_source if final_video_source and final_video_source.exists() else None
-    if mp4_source is None:
-        mp4_candidates = sorted(job.temp_dir.rglob("*.mp4"), key=lambda path: path.stat().st_size if path.exists() else 0, reverse=True)
-        mp4_source = mp4_candidates[0] if mp4_candidates else None
+    webcam_source = _find_first_existing(job, "webcams.webm", "webcams.mp4")
+    deskshare_source = _find_first_existing(job, "deskshare.webm", "deskshare.mp4")
 
+    mp4_source = final_video_source if final_video_source and final_video_source.exists() else None
     if mp4_source is not None:
-        destination = artifact_path(job, "mp4")
-        await store.update_file_status(job.id, "mp4", status="processing", progress=75, stage="Moving lecture video")
-        transcode_ok = await _transcode_final_video(mp4_source, destination)
-        if not transcode_ok:
-            await asyncio.to_thread(shutil.copy2, mp4_source, destination)
-        await store.update_file_status(job.id, "mp4", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
+        await _publish_mp4(job, store, mp4_source, "Publishing lecture video")
+    elif allow_fallback_mp4:
+        fallback_source = webcam_source or deskshare_source
+        if fallback_source is not None:
+            await _publish_mp4(job, store, fallback_source, "Creating fallback lecture video")
 
     located = {
-        "webcam_webm": next(iter(sorted(job.temp_dir.rglob("webcams.webm"))), None),
-        "deskshare_webm": next(iter(sorted(job.temp_dir.rglob("deskshare.webm"))), None),
+        "webcam_webm": webcam_source if webcam_source and webcam_source.suffix.lower() == ".webm" else None,
+        "deskshare_webm": deskshare_source if deskshare_source and deskshare_source.suffix.lower() == ".webm" else None,
     }
 
     for file_type, source in located.items():
@@ -381,6 +421,46 @@ async def _auto_process_derived_files(job: Job, store: JobStore) -> None:
             logger.exception("Automatic processing failed for job %s file %s", job.id, file_type)
 
 
+async def _finish_job_from_artifacts(
+    job: Job,
+    store: JobStore,
+    lines: list[str],
+    final_video_source: Path | None,
+    *,
+    stage: str,
+    allow_fallback_mp4: bool,
+) -> bool:
+    await collect_base_files(job, store, final_video_source, allow_fallback_mp4=allow_fallback_mp4)
+    await _auto_process_derived_files(job, store)
+    await _mark_unavailable_auto_files(job, store, "BBB export did not generate this file")
+    available_files = await refresh_available_files(job, store)
+    if not available_files:
+        return False
+
+    title = job.title
+    date_value = job.date
+    duration_value = _normalise_duration(job.duration) or _extract_last_duration(lines)
+    if final_video_source is not None:
+        inferred_title, inferred_date = _extract_metadata_from_final_video_path(final_video_source)
+        title = title or inferred_title
+        date_value = date_value or inferred_date
+    if title is None and artifact_path(job, "mp4").exists():
+        title = artifact_path(job, "mp4").stem.replace("_", " ")
+
+    await store.update_job(
+        job.id,
+        status="ready",
+        progress=100,
+        stage=stage,
+        title=title,
+        date=date_value,
+        duration=duration_value,
+        available_files=available_files,
+        error=None,
+    )
+    return True
+
+
 async def run_job(job: Job, store: JobStore) -> None:
     process: subprocess.Popen[str] | None = None
     try:
@@ -396,6 +476,11 @@ async def run_job(job: Job, store: JobStore) -> None:
             job.url,
             "--output-dir",
             str(job.temp_dir),
+            "--working-dir",
+            str(job.temp_dir),
+            "--keep-tmp-files",
+            "--audiocodec",
+            "aac",
             "--max-parallel-chromes",
             "2",
         ]
@@ -409,38 +494,36 @@ async def run_job(job: Job, store: JobStore) -> None:
         )
         lines = await _stream_process_output(process, job, store)
         return_code = await asyncio.to_thread(process.wait)
+        final_video_source = _extract_final_video_path(lines)
         if return_code != 0:
             error = lines[-1] if lines else "bbb-dl failed"
             logger.error("bbb-dl job %s failed: %s", job.id, error)
+            await store.update_job(job.id, status="processing", progress=max(job.progress, 80), stage="Recovering available outputs")
+            recovered = await _finish_job_from_artifacts(
+                job,
+                store,
+                lines,
+                final_video_source,
+                stage="Done (recovered from BBB render failure)",
+                allow_fallback_mp4=True,
+            )
+            if recovered:
+                logger.warning("bbb-dl job %s recovered after renderer failure", job.id)
+                return
             await store.update_job(job.id, status="failed", stage="Failed", error=error)
             return
 
-        final_video_source = _extract_final_video_path(lines)
-        available_files = await collect_base_files(job, store, final_video_source)
-        await _auto_process_derived_files(job, store)
-        available_files = await refresh_available_files(job, store)
-
-        title = job.title
-        date_value = job.date
-        duration_value = _normalise_duration(job.duration) or _extract_last_duration(lines)
-        if final_video_source is not None:
-            inferred_title, inferred_date = _extract_metadata_from_final_video_path(final_video_source)
-            title = title or inferred_title
-            date_value = date_value or inferred_date
-        if title is None and artifact_path(job, "mp4").exists():
-            title = artifact_path(job, "mp4").stem.replace("_", " ")
-
-        await store.update_job(
-            job.id,
-            status="ready",
-            progress=100,
+        completed = await _finish_job_from_artifacts(
+            job,
+            store,
+            lines,
+            final_video_source,
             stage="Done",
-            title=title,
-            date=date_value,
-            duration=duration_value,
-            available_files=available_files,
-            error=None,
+            allow_fallback_mp4=False,
         )
+        if not completed:
+            await store.update_job(job.id, status="failed", stage="Failed", error="bbb-dl completed without producing any downloadable files")
+            return
         logger.info("bbb-dl job %s completed", job.id)
     except asyncio.CancelledError:
         logger.info("bbb-dl job %s cancelled", job.id)
