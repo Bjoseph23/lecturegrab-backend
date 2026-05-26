@@ -222,6 +222,32 @@ async def _extract_audio(webcams_path: Path, audio_path: Path) -> bool:
     return (await process.wait()) == 0 and audio_path.exists()
 
 
+async def _transcode_final_video(source: Path, destination: Path) -> bool:
+    if not source.exists():
+        return False
+
+    process = await asyncio.create_subprocess_exec(
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(source),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(destination),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    return (await process.wait()) == 0 and destination.exists()
+
+
 async def cleanup_job_directories(job: Job) -> None:
     for path in (job.temp_dir, job.output_dir):
         if path.exists():
@@ -239,7 +265,9 @@ async def collect_base_files(job: Job, store: JobStore, final_video_source: Path
     if mp4_source is not None:
         destination = artifact_path(job, "mp4")
         await store.update_file_status(job.id, "mp4", status="processing", progress=75, stage="Moving lecture video")
-        await asyncio.to_thread(shutil.move, str(mp4_source), str(destination))
+        transcode_ok = await _transcode_final_video(mp4_source, destination)
+        if not transcode_ok:
+            await asyncio.to_thread(shutil.copy2, mp4_source, destination)
         await store.update_file_status(job.id, "mp4", status="ready", progress=100, stage="Ready", requested_at=datetime.now(UTC))
 
     located = {
